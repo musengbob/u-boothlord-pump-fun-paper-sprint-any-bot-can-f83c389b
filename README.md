@@ -29,15 +29,19 @@ trips). If the coin count lags the pace of the 6-hour window, entry thresholds
 relax in two steps so the bot still banks the minimum instead of sitting on
 idle cash.
 
-## Local backtest (kit dev window, part-00000 subset via the kit's sim engine)
+## Local backtest (fresh kit dev window, kit pilot sim engine)
 
 | Metric | Value |
 |---|---|
-| Net PnL | −0.0804 SOL |
-| Fills / coins / trips | 96 / 47 / 48 |
+| Net PnL | −0.079162 SOL |
+| Fills / coins / trips | 94 / 46 / 47 |
 | Winning trips | 8 |
-| Max drawdown | 0.80% |
-| Net PnL at 2x fees | −0.1126 SOL |
+| Max drawdown | 0.79% |
+| Net PnL at 2x fees | −0.111075 SOL |
+| Determinism | repeat run identical (−0.079162 SOL) |
+
+Guardrails met: 46 distinct coins (≥ 20 required), max drawdown 0.79%
+(≤ 50% allowed), 0.02 SOL tickets (≥ 0.01 SOL round trips).
 
 The dev window is brutally negative-sum after fees (kit pilots: momentum
 −9.489, sniper −0.475, reversion −3.995 SOL) — this bot's edge is losing the
