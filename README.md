@@ -15,7 +15,7 @@ trailing stop instead of capping it with a fixed take-profit. Losers are cut
 fast; the 5-slot position cap turns over quickly.
 
 **Entry** — a coin 3–150 slots old, real SOL 5–50, ≥ 8 buys from ≥ 8 distinct
-non-creator wallets in the last 60 slots, net inflow ≥ 3 SOL and accelerating
+non-creator wallets in the last 60 slots, net inflow ≥ 4 SOL and accelerating
 (newer half beats older half), price up 10–50% from the window start and
 within 2% of the window high, creator has not sold, no single sell ≥ 1.5 SOL.
 One ticket of 0.02 SOL per coin, no adds.

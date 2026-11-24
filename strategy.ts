@@ -28,6 +28,18 @@
 //
 // Deterministic by construction: no clock, no environment, no randomness;
 // iteration only over insertion-ordered maps fed by the batch stream.
+//
+// Speed: the entry window's stats are maintained INCREMENTALLY. Each coin
+// keeps running aggregates (buys, distinct buyers, net inflow split into
+// older/newer halves, window high, biggest sell) that are updated in O(1)
+// amortized per trade at ingest, and the window slides forward by advancing
+// two pointers (first in-window tick, first newer-half tick) — a tick is
+// added to, moved between, or removed from the aggregates exactly once over
+// its life, so no per-batch rescan of any tick list ever happens. Window
+// stats are snapshotted once per batch per coin and shared by the exit and
+// entry checks. Dead coins are pruned from the book map. Decisions are
+// byte-identical to the rescanning version: same parameters, same thresholds,
+// same orders.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
@@ -98,6 +110,15 @@ export const DEFAULT_PARAMS: SprintParams = {
 const LAMPORTS_PER_SOL = 1e9;
 /** Curve fee on a sell: protocol 95 bps + creator 30 bps. */
 const CURVE_FEE = 0.0125;
+/** Prune a book once its coin has not traded for this many slots (and it is
+ *  not held and has no pending order). Far above the oldest age any entry
+ *  check can accept (maxAgeSlots 150, 600 when desperate), so a pruned coin
+ *  could not have been entered anyway: its recreated book has age 1e9. */
+const PRUNE_AFTER_SLOTS = 10000;
+/** How often (batches) the dead-book sweep runs. */
+const PRUNE_EVERY_BATCHES = 256;
+/** Compact a coin's tick array once its dead prefix reaches this length. */
+const COMPACT_TICKS_AT = 1024;
 
 interface Tick {
   slot: number;
@@ -110,7 +131,34 @@ interface Tick {
 interface CoinBook {
   createdSlot: number;
   creator: string;
+  /** Ticks in slot order (the harness feeds slots strictly increasing, and a
+   *  batch's events all carry its slot). `head` is the first retained tick;
+   *  ticks before it were pruned and are dead. */
   ticks: Tick[];
+  head: number;
+  /** First tick index inside the entry window as of aggNow. */
+  winStart: number;
+  /** First tick index in the window's newer half as of aggNow. */
+  midIdx: number;
+  /** Slot the running aggregates were last advanced to. */
+  aggNow: number;
+  /** Running aggregates over the entry window (ticks winStart..end). */
+  buys: number;
+  buySol: number;
+  sellSol: number;
+  netOld: number;
+  netNew: number;
+  /** Distinct buyers inside the window, with their buy counts. */
+  buyerCounts: Map<string, number>;
+  /** Monotonic deques of tick indices, decreasing by price / sell size, for
+   *  the window high and the biggest sell. Heads index the live front. */
+  highD: number[];
+  highHead: number;
+  sellD: number[];
+  sellHead: number;
+  /** Window stats snapshotted once per batch (shared by exit + entry). */
+  cachedStats: WindowStats | null;
+  cachedNow: number;
   devSold: boolean;
   lastTradeSlot: number;
   entries: number;
@@ -147,6 +195,7 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
   let myFills = 0;
   let firstBlockTime: number | null = null;
   let lastBlockTime: number | null = null;
+  let batchNo = 0;
   const keepSlots = Math.max(p.windowSlots, p.flowWindowSlots) + 10;
 
   function bookOf(mint: Pubkey): CoinBook {
@@ -156,6 +205,22 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
         createdSlot: -1,
         creator: '',
         ticks: [],
+        head: 0,
+        winStart: 0,
+        midIdx: 0,
+        aggNow: -1,
+        buys: 0,
+        buySol: 0,
+        sellSol: 0,
+        netOld: 0,
+        netNew: 0,
+        buyerCounts: new Map<string, number>(),
+        highD: [],
+        highHead: 0,
+        sellD: [],
+        sellHead: 0,
+        cachedStats: null,
+        cachedNow: -1,
         devSold: false,
         lastTradeSlot: -1,
         entries: 0,
@@ -168,52 +233,124 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
     return b;
   }
 
-  /** Stats over the entry window ending at `now`, split into older/newer halves. */
-  function windowStats(b: CoinBook, now: number): WindowStats {
+  /**
+   * Slide the coin's running window aggregates forward to `now`: drop ticks
+   * that left the 60-slot entry window (from the aggregates and from the
+   * monotonic deque fronts) and move ticks that crossed the window's
+   * midpoint from the newer half to the older half. Each tick crosses each
+   * boundary once, so this is O(1) amortized per tick over the run.
+   */
+  function advanceTo(b: CoinBook, now: number): void {
+    if (now <= b.aggNow) return;
     const from = now - p.windowSlots;
     const mid = now - p.windowSlots / 2;
-    const st: WindowStats = {
-      buys: 0, buyers: 0, net: 0, netOld: 0, netNew: 0,
-      startPrice: -1, high: 0, last: 0, biggestSell: 0,
-    };
-    const buyers = new Set<string>();
-    let buySol = 0;
-    let sellSol = 0;
-    for (const t of b.ticks) {
-      if (t.slot <= from) {
-        // Ticks at or before the window edge pin the window-start price.
-        st.startPrice = t.price;
-        continue;
-      }
-      if (st.startPrice < 0) st.startPrice = t.price;
+    const ticks = b.ticks;
+    // Midpoint first: move ticks that crossed it from the newer half to the
+    // older half, so every tick the window loop below drops is already in
+    // the older half (slot <= from < mid) and netOld is the right bucket.
+    while (b.midIdx < ticks.length && ticks[b.midIdx]!.slot <= mid) {
+      const t = ticks[b.midIdx]!;
       const signed = t.buy ? t.sol : -t.sol;
-      if (t.slot <= mid) st.netOld += signed;
-      else st.netNew += signed;
-      if (t.buy) {
-        st.buys++;
-        buySol += t.sol;
-        buyers.add(t.user);
-      } else {
-        sellSol += t.sol;
-        if (t.sol > st.biggestSell) st.biggestSell = t.sol;
-      }
-      if (t.price > st.high) st.high = t.price;
-      st.last = t.price;
+      b.netNew -= signed;
+      b.netOld += signed;
+      b.midIdx++;
     }
-    st.buyers = buyers.size;
-    st.net = buySol - sellSol;
-    return st;
+    // Then drop ticks that left the window entirely.
+    while (b.winStart < ticks.length && ticks[b.winStart]!.slot <= from) {
+      const t = ticks[b.winStart]!;
+      const signed = t.buy ? t.sol : -t.sol;
+      b.netOld -= signed;
+      if (t.buy) {
+        b.buys--;
+        b.buySol -= t.sol;
+        const c = (b.buyerCounts.get(t.user) ?? 0) - 1;
+        if (c <= 0) b.buyerCounts.delete(t.user);
+        else b.buyerCounts.set(t.user, c);
+      } else {
+        b.sellSol -= t.sol;
+      }
+      b.winStart++;
+    }
+    while (b.highHead < b.highD.length && b.highD[b.highHead]! < b.winStart) b.highHead++;
+    while (b.sellHead < b.sellD.length && b.sellD[b.sellHead]! < b.winStart) b.sellHead++;
+    b.aggNow = now;
   }
 
-  /** Net SOL flow over the last `span` slots (newest ticks first). */
-  function flowOver(b: CoinBook, now: number, span: number): number {
-    let net = 0;
-    for (let i = b.ticks.length - 1; i >= 0; i--) {
-      const t = b.ticks[i]!;
-      if (t.slot <= now - span) break;
-      net += t.buy ? t.sol : -t.sol;
+  /**
+   * Record one trade tick, updating the running window aggregates for `now`
+   * in O(1) amortized. Ticks arrive in slot order and a batch's events all
+   * carry its slot, so a fresh tick is always inside the window, in the
+   * newer half; the older-half / pre-window branches exist only so the
+   * accounting stays exact if an old tick ever arrives.
+   */
+  function addTick(b: CoinBook, t: Tick, now: number): void {
+    advanceTo(b, now);
+    // A new tick changes the aggregates, so any snapshot taken at this
+    // `now` is stale; the next statsOf recomputes it.
+    b.cachedStats = null;
+    b.cachedNow = -1;
+    const idx = b.ticks.length;
+    b.ticks.push(t);
+    if (t.slot <= now - p.windowSlots) {
+      // Pre-window: it pins the window-start price only, never the sums.
+      // Every earlier tick is pre-window too (slot order), so both
+      // boundaries sit at idx and move past this tick.
+      b.winStart = idx + 1;
+      b.midIdx = idx + 1;
+      return;
     }
-    return net;
+    if (t.buy) {
+      b.buys++;
+      b.buySol += t.sol;
+      b.buyerCounts.set(t.user, (b.buyerCounts.get(t.user) ?? 0) + 1);
+    } else {
+      b.sellSol += t.sol;
+    }
+    if (t.slot <= now - p.windowSlots / 2) {
+      b.netOld += t.buy ? t.sol : -t.sol;
+      b.midIdx = idx + 1;
+    } else {
+      b.netNew += t.buy ? t.sol : -t.sol;
+    }
+    while (b.highD.length > b.highHead && b.ticks[b.highD[b.highD.length - 1]!]!.price <= t.price) b.highD.pop();
+    b.highD.push(idx);
+    if (!t.buy) {
+      while (b.sellD.length > b.sellHead && b.ticks[b.sellD[b.sellD.length - 1]!]!.sol <= t.sol) b.sellD.pop();
+      b.sellD.push(idx);
+    }
+  }
+
+  /**
+   * Stats over the entry window ending at `now`, split into older/newer
+   * halves — the same values the old rescanning windowStats computed, read
+   * off the running aggregates. Snapshotted once per batch per coin: the
+   * exit and entry checks in one batch share the object. Net flow over the
+   * last 30 slots is netNew, over the last 60 slots is net.
+   */
+  function statsOf(b: CoinBook, now: number): WindowStats {
+    if (b.cachedNow === now && b.cachedStats !== null) return b.cachedStats;
+    advanceTo(b, now);
+    const n = b.ticks.length;
+    const st: WindowStats = {
+      buys: b.buys,
+      buyers: b.buyerCounts.size,
+      net: b.buySol - b.sellSol,
+      netOld: b.netOld,
+      netNew: b.netNew,
+      // Window-start price: the newest retained tick at or before the
+      // window edge, else the oldest in-window tick's price.
+      startPrice: b.winStart > b.head
+        ? b.ticks[b.winStart - 1]!.price
+        : b.winStart < n
+          ? b.ticks[b.winStart]!.price
+          : -1,
+      high: b.highHead < b.highD.length ? b.ticks[b.highD[b.highHead]!]!.price : 0,
+      last: n > b.winStart ? b.ticks[n - 1]!.price : 0,
+      biggestSell: b.sellHead < b.sellD.length ? b.ticks[b.sellD[b.sellHead]!]!.sol : 0,
+    };
+    b.cachedStats = st;
+    b.cachedNow = now;
+    return st;
   }
 
   /** What selling `tokens` against (vq, vt) pays, in SOL, after curve + tx fees. */
@@ -229,6 +366,7 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
       const tx = state.txFeeLamports();
       const txSol = Number(tx) / LAMPORTS_PER_SOL;
       const traded = new Set<Pubkey>();
+      batchNo++;
 
       // Own fills: count coins/fills for pacing, track filled SOL per coin.
       for (const f of batch.fills) {
@@ -256,13 +394,13 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
         } else if (e.event === 'TradeEvent') {
           const b = bookOf(e.mint);
           const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-          b.ticks.push({
+          addTick(b, {
             slot: e.slot,
             buy: e.is_buy,
             sol: Number(e.sol_amount) / LAMPORTS_PER_SOL,
             user: e.user,
             price,
-          });
+          }, now);
           b.lastTradeSlot = e.slot;
           traded.add(e.mint);
           if (!e.is_buy && e.user === b.creator) b.devSold = true;
@@ -271,12 +409,24 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
           if (b !== undefined) b.lastTradeSlot = e.slot;
         }
       }
-      // Drop ticks older than any window we still consult.
+      // Drop ticks older than any window we still consult (prune head only;
+      // the aggregates already exclude them).
       for (const mint of traded) {
         const b = books.get(mint)!;
-        let cut = 0;
-        while (cut < b.ticks.length && b.ticks[cut]!.slot <= now - keepSlots) cut++;
-        if (cut > 0) b.ticks.splice(0, cut);
+        while (b.head < b.ticks.length && b.ticks[b.head]!.slot <= now - keepSlots) b.head++;
+        if (b.head >= COMPACT_TICKS_AT) {
+          const cut = b.head;
+          while (b.highHead < b.highD.length && b.highD[b.highHead]! < cut) b.highHead++;
+          while (b.sellHead < b.sellD.length && b.sellD[b.sellHead]! < cut) b.sellHead++;
+          b.ticks = b.ticks.slice(cut);
+          b.winStart -= cut;
+          b.midIdx -= cut;
+          b.head = 0;
+          if (b.highHead > 0) { b.highD = b.highD.slice(b.highHead); b.highHead = 0; }
+          if (b.sellHead > 0) { b.sellD = b.sellD.slice(b.sellHead); b.sellHead = 0; }
+          for (let i = 0; i < b.highD.length; i++) b.highD[i]! -= cut;
+          for (let i = 0; i < b.sellD.length; i++) b.sellD[i]! -= cut;
+        }
       }
 
       const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
@@ -286,6 +436,18 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
         if (po.order.side === 'buy') rec.buy = true;
         else rec.sell = true;
         pendingByMint.set(po.order.mint, rec);
+      }
+
+      // Prune dead books: a coin that has not traded for a long time, is not
+      // held and has no pending order can never be entered again (its age
+      // alone blocks it), so dropping its book changes no decision.
+      if (batchNo % PRUNE_EVERY_BATCHES === 0) {
+        for (const [mint, b] of books) {
+          if (held.has(mint)) continue;
+          if (pendingByMint.has(mint)) continue;
+          if (now - b.lastTradeSlot <= PRUNE_AFTER_SLOTS) continue;
+          books.delete(mint);
+        }
       }
 
       // Pacing: how far through the window are we, and is the coin count lagging?
@@ -328,8 +490,8 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
         if (!exit && cost > 0 && o.peakValueSol >= cost * (1 + p.trailArm) && value < o.peakValueSol * (1 - p.trailGiveback)) exit = true;
         if (!exit && now - o.openedSlot > p.maxHoldSlots) exit = true;
         if (!exit && b.devSold) exit = true;
-        if (!exit && windowStats(b, now).biggestSell >= p.bigSellSol) exit = true;
-        if (!exit && flowOver(b, now, p.flowWindowSlots) < -p.exitFlowSol) exit = true;
+        if (!exit && statsOf(b, now).biggestSell >= p.bigSellSol) exit = true;
+        if (!exit && statsOf(b, now).netNew < -p.exitFlowSol) exit = true;
         if (!exit && now - b.lastTradeSlot > p.staleSlots) exit = true;
         if (!exit) continue;
         o.exiting = true;
@@ -355,7 +517,7 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
           // Add once into strength: price stepped up, inflow still positive.
           if (pos.exiting || b.filledSol >= p.maxPerCoinSol - 0.005) continue;
           if (price < pos.lastBuyPrice * (1 + p.addStepUp)) continue;
-          if (flowOver(b, now, p.windowSlots) < p.minNetInflowSol / 2) continue;
+          if (statsOf(b, now).net < p.minNetInflowSol / 2) continue;
           const capSol = Number(state.maxBuyLamports(mint)) / LAMPORTS_PER_SOL;
           let amount = Math.min(capSol, p.addTicketSol, p.maxPerCoinSol - b.filledSol);
           if (amount > free - txSol) amount = free - txSol;
@@ -375,7 +537,7 @@ export function createStrategy(p: SprintParams = DEFAULT_PARAMS): Bot {
         if (age < p.minAgeSlots || age > maxAge) continue;
         if (realSol < (desperate ? 2 : p.minRealSol) || realSol > p.maxRealSol) continue;
         if (b.devSold) continue;
-        const s = windowStats(b, now);
+        const s = statsOf(b, now);
         const minBuys = desperate ? 2 : relaxed ? 3 : p.minWindowBuys;
         const minBuyers = desperate ? 2 : relaxed ? 2 : p.minWindowBuyers;
         const minNet = desperate ? 0.1 : relaxed ? 0.3 : p.minNetInflowSol;
