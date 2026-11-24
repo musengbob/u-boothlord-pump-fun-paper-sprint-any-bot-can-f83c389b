@@ -9,7 +9,7 @@
 //
 // Entry (first buy on a coin): coin 3-150 slots old, real SOL reserve 5-50,
 // at least 8 buys from at least 8 distinct non-creator wallets inside the
-// last 60 slots, net inflow >= 3 SOL and accelerating (the newer half of the
+// last 60 slots, net inflow >= 4 SOL and accelerating (the newer half of the
 // window beats the older half), price up 10-50% from the window start and
 // within 2% of the window high, creator has not sold, no single sell >= 1.5
 // SOL. One ticket of 0.02 SOL, no adds: on the dev window every add and every
@@ -71,7 +71,7 @@ export const DEFAULT_PARAMS: SprintParams = {
   maxRealSol: 50,
   minWindowBuys: 8,
   minWindowBuyers: 8,
-  minNetInflowSol: 3,
+  minNetInflowSol: 4,
   minRise: 0.1,
   maxRise: 0.5,
   nearHigh: 0.98,
